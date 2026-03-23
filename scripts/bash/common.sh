@@ -152,6 +152,7 @@ get_feature_paths() {
     printf 'RESEARCH=%q\n' "$feature_dir/research.md"
     printf 'DATA_MODEL=%q\n' "$feature_dir/data-model.md"
     printf 'QUICKSTART=%q\n' "$feature_dir/quickstart.md"
+    printf 'VERIFY_REPORT=%q\n' "$feature_dir/verify-report.md"
     printf 'CONTRACTS_DIR=%q\n' "$feature_dir/contracts"
 }
 
