@@ -53,10 +53,10 @@ Install once and use everywhere. Pin a specific release tag for stability (check
 
 ```bash
 # Install a specific stable release (recommended — replace vX.Y.Z with the latest tag)
-uv tool install specify-cli --from git+https://github.com/github/spec-kit.git@vX.Y.Z
+uv tool install specify-cli --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git@vX.Y.Z
 
 # Or install latest from main (may include unreleased changes)
-uv tool install specify-cli --from git+https://github.com/github/spec-kit.git
+uv tool install specify-cli --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git
 ```
 
 Then use the tool directly:
@@ -77,7 +77,7 @@ specify check
 To upgrade Specify, see the [Upgrade Guide](./docs/upgrade.md) for detailed instructions. Quick upgrade:
 
 ```bash
-uv tool install specify-cli --force --from git+https://github.com/github/spec-kit.git@vX.Y.Z
+uv tool install specify-cli --force --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git@vX.Y.Z
 ```
 
 #### Option 2: One-time Usage
@@ -86,12 +86,12 @@ Run directly without installing:
 
 ```bash
 # Create new project (pinned to a stable release — replace vX.Y.Z with the latest tag)
-uvx --from git+https://github.com/github/spec-kit.git@vX.Y.Z specify init <PROJECT_NAME>
+uvx --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git@vX.Y.Z specify init <PROJECT_NAME>
 
 # Or initialize in existing project
-uvx --from git+https://github.com/github/spec-kit.git@vX.Y.Z specify init . --ai claude
+uvx --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git@vX.Y.Z specify init . --ai claude
 # or
-uvx --from git+https://github.com/github/spec-kit.git@vX.Y.Z specify init --here --ai claude
+uvx --from git+https://github.com/arkus-mind-teams/mt-spec-kit.git@vX.Y.Z specify init --here --ai claude
 ```
 
 **Benefits of persistent installation:**
