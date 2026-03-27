@@ -11,10 +11,12 @@ Tests cover:
 """
 
 import re
+import zipfile
 import pytest
 import tempfile
 import shutil
 import yaml
+import typer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,8 +24,8 @@ import specify_cli
 
 from specify_cli import (
     _get_skills_dir,
+    _migrate_legacy_kimi_dotted_skills,
     install_ai_skills,
-    AGENT_SKILLS_DIR_OVERRIDES,
     DEFAULT_SKILLS_DIR,
     SKILL_DESCRIPTIONS,
     AGENT_CONFIG,
@@ -167,8 +169,8 @@ class TestGetSkillsDir:
         result = _get_skills_dir(project_dir, "copilot")
         assert result == project_dir / ".github" / "skills"
 
-    def test_codex_uses_override(self, project_dir):
-        """Codex should use the AGENT_SKILLS_DIR_OVERRIDES value."""
+    def test_codex_skills_dir_from_agent_config(self, project_dir):
+        """Codex should resolve skills directory from AGENT_CONFIG folder."""
         result = _get_skills_dir(project_dir, "codex")
         assert result == project_dir / ".agents" / "skills"
 
@@ -201,12 +203,71 @@ class TestGetSkillsDir:
             # Should always end with "skills"
             assert result.name == "skills"
 
-    def test_override_takes_precedence_over_config(self, project_dir):
-        """AGENT_SKILLS_DIR_OVERRIDES should take precedence over AGENT_CONFIG."""
-        for agent_key in AGENT_SKILLS_DIR_OVERRIDES:
-            result = _get_skills_dir(project_dir, agent_key)
-            expected = project_dir / AGENT_SKILLS_DIR_OVERRIDES[agent_key]
-            assert result == expected
+class TestKimiLegacySkillMigration:
+    """Test temporary migration from Kimi dotted skill names to hyphenated names."""
+
+    def test_migrates_legacy_dotted_skill_directory(self, project_dir):
+        skills_dir = project_dir / ".kimi" / "skills"
+        legacy_dir = skills_dir / "speckit.plan"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "SKILL.md").write_text("legacy")
+
+        migrated, removed = _migrate_legacy_kimi_dotted_skills(skills_dir)
+
+        assert migrated == 1
+        assert removed == 0
+        assert not legacy_dir.exists()
+        assert (skills_dir / "speckit-plan" / "SKILL.md").exists()
+
+    def test_removes_legacy_dir_when_hyphenated_target_exists_with_same_content(self, project_dir):
+        skills_dir = project_dir / ".kimi" / "skills"
+        legacy_dir = skills_dir / "speckit.plan"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "SKILL.md").write_text("legacy")
+        target_dir = skills_dir / "speckit-plan"
+        target_dir.mkdir(parents=True)
+        (target_dir / "SKILL.md").write_text("legacy")
+
+        migrated, removed = _migrate_legacy_kimi_dotted_skills(skills_dir)
+
+        assert migrated == 0
+        assert removed == 1
+        assert not legacy_dir.exists()
+        assert (target_dir / "SKILL.md").read_text() == "legacy"
+
+    def test_keeps_legacy_dir_when_hyphenated_target_differs(self, project_dir):
+        skills_dir = project_dir / ".kimi" / "skills"
+        legacy_dir = skills_dir / "speckit.plan"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "SKILL.md").write_text("legacy")
+        target_dir = skills_dir / "speckit-plan"
+        target_dir.mkdir(parents=True)
+        (target_dir / "SKILL.md").write_text("new")
+
+        migrated, removed = _migrate_legacy_kimi_dotted_skills(skills_dir)
+
+        assert migrated == 0
+        assert removed == 0
+        assert legacy_dir.exists()
+        assert (legacy_dir / "SKILL.md").read_text() == "legacy"
+        assert (target_dir / "SKILL.md").read_text() == "new"
+
+    def test_keeps_legacy_dir_when_matching_target_but_extra_files_exist(self, project_dir):
+        skills_dir = project_dir / ".kimi" / "skills"
+        legacy_dir = skills_dir / "speckit.plan"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "SKILL.md").write_text("legacy")
+        (legacy_dir / "notes.txt").write_text("custom")
+        target_dir = skills_dir / "speckit-plan"
+        target_dir.mkdir(parents=True)
+        (target_dir / "SKILL.md").write_text("legacy")
+
+        migrated, removed = _migrate_legacy_kimi_dotted_skills(skills_dir)
+
+        assert migrated == 0
+        assert removed == 0
+        assert legacy_dir.exists()
+        assert (legacy_dir / "notes.txt").read_text() == "custom"
 
 
 # ===== install_ai_skills Tests =====
@@ -471,8 +532,7 @@ class TestInstallAiSkills:
         skills_dir = _get_skills_dir(proj, agent_key)
         assert skills_dir.exists()
         skill_dirs = [d.name for d in skills_dir.iterdir() if d.is_dir()]
-        # Kimi uses dotted skill names; other agents use hyphen-separated names.
-        expected_skill_name = "speckit.specify" if agent_key == "kimi" else "speckit-specify"
+        expected_skill_name = "speckit-specify"
         assert expected_skill_name in skill_dirs
         assert (skills_dir / expected_skill_name / "SKILL.md").exists()
 
@@ -720,8 +780,8 @@ class TestNewProjectCommandSkip:
         mock_skills.assert_not_called()
         assert (target / ".agents" / "skills" / "speckit-specify" / "SKILL.md").exists()
 
-    def test_codex_native_skills_missing_fails_clearly(self, tmp_path):
-        """Codex native skills init should fail if bundled skills are missing."""
+    def test_codex_native_skills_missing_falls_back_then_fails_cleanly(self, tmp_path):
+        """Codex should attempt fallback conversion when bundled skills are missing."""
         from typer.testing import CliRunner
 
         runner = CliRunner()
@@ -730,7 +790,7 @@ class TestNewProjectCommandSkip:
         with patch("specify_cli.download_and_extract_template", lambda *args, **kwargs: None), \
              patch("specify_cli.ensure_executable_scripts"), \
              patch("specify_cli.ensure_constitution_from_template"), \
-             patch("specify_cli.install_ai_skills") as mock_skills, \
+             patch("specify_cli.install_ai_skills", return_value=False) as mock_skills, \
              patch("specify_cli.is_git_repo", return_value=False), \
              patch("specify_cli.shutil.which", return_value="/usr/bin/codex"):
             result = runner.invoke(
@@ -739,11 +799,13 @@ class TestNewProjectCommandSkip:
             )
 
         assert result.exit_code == 1
-        mock_skills.assert_not_called()
+        mock_skills.assert_called_once()
+        assert mock_skills.call_args.kwargs.get("overwrite_existing") is True
         assert "Expected bundled agent skills" in result.output
+        assert "fallback conversion failed" in result.output
 
     def test_codex_native_skills_ignores_non_speckit_skill_dirs(self, tmp_path):
-        """Non-spec-kit SKILL.md files should not satisfy Codex bundled-skills validation."""
+        """Non-spec-kit SKILL.md files should trigger fallback conversion, not hard-fail."""
         from typer.testing import CliRunner
 
         runner = CliRunner()
@@ -757,7 +819,7 @@ class TestNewProjectCommandSkip:
         with patch("specify_cli.download_and_extract_template", side_effect=fake_download), \
              patch("specify_cli.ensure_executable_scripts"), \
              patch("specify_cli.ensure_constitution_from_template"), \
-             patch("specify_cli.install_ai_skills") as mock_skills, \
+             patch("specify_cli.install_ai_skills", return_value=True) as mock_skills, \
              patch("specify_cli.is_git_repo", return_value=False), \
              patch("specify_cli.shutil.which", return_value="/usr/bin/codex"):
             result = runner.invoke(
@@ -765,9 +827,126 @@ class TestNewProjectCommandSkip:
                 ["init", str(target), "--ai", "codex", "--ai-skills", "--script", "sh", "--no-git"],
             )
 
-        assert result.exit_code == 1
-        mock_skills.assert_not_called()
-        assert "Expected bundled agent skills" in result.output
+        assert result.exit_code == 0
+        mock_skills.assert_called_once()
+        assert mock_skills.call_args.kwargs.get("overwrite_existing") is True
+
+    def test_kimi_legacy_migration_runs_without_ai_skills_flag(self, tmp_path):
+        """Kimi init should migrate dotted legacy skills even when --ai-skills is not set."""
+        from typer.testing import CliRunner
+
+        runner = CliRunner()
+        target = tmp_path / "kimi-legacy-no-ai-skills"
+
+        def fake_download(project_path, *args, **kwargs):
+            legacy_dir = project_path / ".kimi" / "skills" / "speckit.plan"
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_dir / "SKILL.md").write_text("---\nname: speckit.plan\n---\n\nlegacy\n")
+
+        with patch("specify_cli.download_and_extract_template", side_effect=fake_download), \
+             patch("specify_cli.ensure_executable_scripts"), \
+             patch("specify_cli.ensure_constitution_from_template"), \
+             patch("specify_cli.is_git_repo", return_value=False), \
+             patch("specify_cli.shutil.which", return_value="/usr/bin/kimi"):
+            result = runner.invoke(
+                app,
+                ["init", str(target), "--ai", "kimi", "--script", "sh", "--no-git"],
+            )
+
+        assert result.exit_code == 0
+        assert not (target / ".kimi" / "skills" / "speckit.plan").exists()
+        assert (target / ".kimi" / "skills" / "speckit-plan" / "SKILL.md").exists()
+
+    def test_codex_ai_skills_here_mode_preserves_existing_codex_dir(self, tmp_path, monkeypatch):
+        """Codex --here skills init should not delete a pre-existing .codex directory."""
+        from typer.testing import CliRunner
+
+        runner = CliRunner()
+        target = tmp_path / "codex-preserve-here"
+        target.mkdir()
+        existing_prompts = target / ".codex" / "prompts"
+        existing_prompts.mkdir(parents=True)
+        (existing_prompts / "custom.md").write_text("custom")
+        monkeypatch.chdir(target)
+
+        with patch("specify_cli.download_and_extract_template", return_value=target), \
+             patch("specify_cli.ensure_executable_scripts"), \
+             patch("specify_cli.ensure_constitution_from_template"), \
+             patch("specify_cli.install_ai_skills", return_value=True), \
+             patch("specify_cli.is_git_repo", return_value=True), \
+             patch("specify_cli.shutil.which", return_value="/usr/bin/codex"):
+            result = runner.invoke(
+                app,
+                ["init", "--here", "--ai", "codex", "--ai-skills", "--script", "sh", "--no-git"],
+                input="y\n",
+            )
+
+        assert result.exit_code == 0
+        assert (target / ".codex").exists()
+        assert (existing_prompts / "custom.md").exists()
+
+    def test_codex_ai_skills_fresh_dir_does_not_create_codex_dir(self, tmp_path):
+        """Fresh-directory Codex skills init should not leave legacy .codex from archive."""
+        target = tmp_path / "fresh-codex-proj"
+        archive = tmp_path / "codex-template.zip"
+
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("template-root/.codex/prompts/speckit.specify.md", "legacy")
+            zf.writestr("template-root/.specify/templates/constitution-template.md", "constitution")
+
+        fake_meta = {
+            "filename": archive.name,
+            "size": archive.stat().st_size,
+            "release": "vtest",
+            "asset_url": "https://example.invalid/template.zip",
+        }
+
+        with patch("specify_cli.download_template_from_github", return_value=(archive, fake_meta)):
+            specify_cli.download_and_extract_template(
+                target,
+                "codex",
+                "sh",
+                is_current_dir=False,
+                skip_legacy_codex_prompts=True,
+                verbose=False,
+            )
+
+        assert target.exists()
+        assert (target / ".specify").exists()
+        assert not (target / ".codex").exists()
+
+    @pytest.mark.parametrize("is_current_dir", [False, True])
+    def test_download_and_extract_template_blocks_zip_path_traversal(self, tmp_path, monkeypatch, is_current_dir):
+        """Extraction should reject ZIP members escaping the target directory."""
+        target = (tmp_path / "here-proj") if is_current_dir else (tmp_path / "new-proj")
+        if is_current_dir:
+            target.mkdir()
+            monkeypatch.chdir(target)
+
+        archive = tmp_path / "malicious-template.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("../evil.txt", "pwned")
+            zf.writestr("template-root/.specify/templates/constitution-template.md", "constitution")
+
+        fake_meta = {
+            "filename": archive.name,
+            "size": archive.stat().st_size,
+            "release": "vtest",
+            "asset_url": "https://example.invalid/template.zip",
+        }
+
+        with patch("specify_cli.download_template_from_github", return_value=(archive, fake_meta)):
+            with pytest.raises(typer.Exit):
+                specify_cli.download_and_extract_template(
+                    target,
+                    "codex",
+                    "sh",
+                    is_current_dir=is_current_dir,
+                    skip_legacy_codex_prompts=True,
+                    verbose=False,
+                )
+
+        assert not (tmp_path / "evil.txt").exists()
 
     def test_commands_preserved_when_skills_fail(self, tmp_path):
         """If skills fail, commands should NOT be removed (safety net)."""
@@ -858,6 +1037,21 @@ class TestSkipIfExists:
         skill_dirs = [d.name for d in skills_dir.iterdir() if d.is_dir()]
         # All 4 templates should produce skills (specify, plan, tasks, empty_fm)
         assert len(skill_dirs) == 4
+
+    def test_existing_skill_overwritten_when_enabled(self, project_dir, templates_dir):
+        """When overwrite_existing=True, pre-existing SKILL.md should be replaced."""
+        skill_dir = project_dir / ".claude" / "skills" / "speckit-specify"
+        skill_dir.mkdir(parents=True)
+        custom_content = "# My Custom Specify Skill\nUser-modified content\n"
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(custom_content)
+
+        result = install_ai_skills(project_dir, "claude", overwrite_existing=True)
+
+        assert result is True
+        updated_content = skill_file.read_text()
+        assert updated_content != custom_content
+        assert "name: speckit-specify" in updated_content
 
 
 # ===== SKILL_DESCRIPTIONS Coverage Tests =====
@@ -1008,12 +1202,12 @@ class TestCliValidation:
             assert "Optional skills that you can use for your specs" in result.output
 
     def test_kimi_next_steps_show_skill_invocation(self, monkeypatch):
-        """Kimi next-steps guidance should display /skill:speckit.* usage."""
+        """Kimi next-steps guidance should display /skill:speckit-* usage."""
         from typer.testing import CliRunner
 
         def _fake_download(*args, **kwargs):
             project_path = Path(args[0])
-            skill_dir = project_path / ".kimi" / "skills" / "speckit.specify"
+            skill_dir = project_path / ".kimi" / "skills" / "speckit-specify"
             skill_dir.mkdir(parents=True, exist_ok=True)
             (skill_dir / "SKILL.md").write_text("---\ndescription: Test skill\n---\n\nBody.\n")
 
@@ -1027,7 +1221,7 @@ class TestCliValidation:
             )
 
             assert result.exit_code == 0
-            assert "/skill:speckit.constitution" in result.output
+            assert "/skill:speckit-constitution" in result.output
             assert "/speckit.constitution" not in result.output
             assert "Optional skills that you can use for your specs" in result.output
 

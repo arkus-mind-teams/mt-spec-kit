@@ -948,9 +948,26 @@ def download_template_from_github(ai_assistant: str, download_dir: Path, *, scri
     }
     return zip_path, metadata
 
-def download_and_extract_template(project_path: Path, ai_assistant: str, script_type: str, is_current_dir: bool = False, *, verbose: bool = True, tracker: StepTracker | None = None, client: httpx.Client = None, debug: bool = False, github_token: str = None) -> Path:
+def download_and_extract_template(
+    project_path: Path,
+    ai_assistant: str,
+    script_type: str,
+    is_current_dir: bool = False,
+    *,
+    skip_legacy_codex_prompts: bool = False,
+    verbose: bool = True,
+    tracker: StepTracker | None = None,
+    client: httpx.Client = None,
+    debug: bool = False,
+    github_token: str = None,
+) -> Path:
     """Download the latest release and extract it to create a new project.
     Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup)
+
+    Note:
+        ``skip_legacy_codex_prompts`` suppresses the legacy top-level
+        ``.codex`` directory from older template archives in Codex skills mode.
+        The name is kept for backward compatibility with existing callers.
     """
     current_dir = Path.cwd()
 
@@ -990,6 +1007,19 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
             project_path.mkdir(parents=True)
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            def _validate_zip_members_within(root: Path) -> None:
+                """Validate all ZIP members stay within ``root`` (Zip Slip guard)."""
+                root_resolved = root.resolve()
+                for member in zip_ref.namelist():
+                    member_path = (root / member).resolve()
+                    try:
+                        member_path.relative_to(root_resolved)
+                    except ValueError:
+                        raise RuntimeError(
+                            f"Unsafe path in ZIP archive: {member} "
+                            "(potential path traversal)"
+                        )
+
             zip_contents = zip_ref.namelist()
             if tracker:
                 tracker.start("zip-list")
@@ -1000,6 +1030,7 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
             if is_current_dir:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     temp_path = Path(temp_dir)
+                    _validate_zip_members_within(temp_path)
                     zip_ref.extractall(temp_path)
 
                     extracted_items = list(temp_path.iterdir())
@@ -1019,6 +1050,11 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
                             console.print("[cyan]Found nested directory structure[/cyan]")
 
                     for item in source_dir.iterdir():
+                        # In Codex skills mode, do not materialize the legacy
+                        # top-level .codex directory from older prompt-based
+                        # template archives.
+                        if skip_legacy_codex_prompts and ai_assistant == "codex" and item.name == ".codex":
+                            continue
                         dest_path = project_path / item.name
                         if item.is_dir():
                             if dest_path.exists():
@@ -1043,6 +1079,7 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
                     if verbose and not tracker:
                         console.print("[cyan]Template files merged into current directory[/cyan]")
             else:
+                _validate_zip_members_within(project_path)
                 zip_ref.extractall(project_path)
 
                 extracted_items = list(project_path.iterdir())
@@ -1068,6 +1105,13 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
                         tracker.complete("flatten")
                     elif verbose:
                         console.print("[cyan]Flattened nested directory structure[/cyan]")
+
+                # For fresh-directory Codex skills init, suppress legacy
+                # top-level .codex layout extracted from older archives.
+                if skip_legacy_codex_prompts and ai_assistant == "codex":
+                    legacy_codex_dir = project_path / ".codex"
+                    if legacy_codex_dir.is_dir():
+                        shutil.rmtree(legacy_codex_dir, ignore_errors=True)
 
     except Exception as e:
         if tracker:
@@ -1446,12 +1490,6 @@ def load_init_options(project_path: Path) -> dict[str, Any]:
         return {}
 
 
-# Agent-specific skill directory overrides for agents whose skills directory
-# doesn't follow the standard <agent_folder>/skills/ pattern
-AGENT_SKILLS_DIR_OVERRIDES = {
-    "codex": ".agents/skills",  # Codex agent layout override
-}
-
 # Default skills directory for agents not in AGENT_CONFIG
 DEFAULT_SKILLS_DIR = ".agents/skills"
 
@@ -1484,13 +1522,9 @@ SKILL_DESCRIPTIONS = {
 def _get_skills_dir(project_path: Path, selected_ai: str) -> Path:
     """Resolve the agent-specific skills directory for the given AI assistant.
 
-    Uses ``AGENT_SKILLS_DIR_OVERRIDES`` first, then falls back to
-    ``AGENT_CONFIG[agent]["folder"] + "skills"``, and finally to
-    ``DEFAULT_SKILLS_DIR``.
+    Uses ``AGENT_CONFIG[agent]["folder"] + "skills"`` and falls back to
+    ``DEFAULT_SKILLS_DIR`` for unknown agents.
     """
-    if selected_ai in AGENT_SKILLS_DIR_OVERRIDES:
-        return project_path / AGENT_SKILLS_DIR_OVERRIDES[selected_ai]
-
     agent_config = AGENT_CONFIG.get(selected_ai, {})
     agent_folder = agent_config.get("folder", "")
     if agent_folder:
@@ -1499,18 +1533,27 @@ def _get_skills_dir(project_path: Path, selected_ai: str) -> Path:
     return project_path / DEFAULT_SKILLS_DIR
 
 
-def install_ai_skills(project_path: Path, selected_ai: str, tracker: StepTracker | None = None) -> bool:
+def install_ai_skills(
+    project_path: Path,
+    selected_ai: str,
+    tracker: StepTracker | None = None,
+    *,
+    overwrite_existing: bool = False,
+) -> bool:
     """Install Prompt.MD files from templates/commands/ as agent skills.
 
     Skills are written to the agent-specific skills directory following the
     `agentskills.io <https://agentskills.io/specification>`_ specification.
-    Installation is additive — existing files are never removed and prompt
-    command files in the agent's commands directory are left untouched.
+    Installation is additive by default — existing files are never removed and
+    prompt command files in the agent's commands directory are left untouched.
 
     Args:
         project_path: Target project directory.
         selected_ai: AI assistant key from ``AGENT_CONFIG``.
         tracker: Optional progress tracker.
+        overwrite_existing: When True, overwrite any existing ``SKILL.md`` file
+            in the target skills directory (including user-authored content).
+            Defaults to False.
 
     Returns:
         ``True`` if at least one skill was installed or all skills were
@@ -1595,10 +1638,7 @@ def install_ai_skills(project_path: Path, selected_ai: str, tracker: StepTracker
                 command_name = command_name[len("speckit."):]
             if command_name.endswith(".agent"):
                 command_name = command_name[:-len(".agent")]
-            if selected_ai == "kimi":
-                skill_name = f"speckit.{command_name}"
-            else:
-                skill_name = f"speckit-{command_name}"
+            skill_name = f"speckit-{command_name.replace('.', '-')}"
 
             # Create skill directory (additive — never removes existing content)
             skill_dir = skills_dir / skill_name
@@ -1640,9 +1680,10 @@ def install_ai_skills(project_path: Path, selected_ai: str, tracker: StepTracker
 
             skill_file = skill_dir / "SKILL.md"
             if skill_file.exists():
-                # Do not overwrite user-customized skills on re-runs
-                skipped_count += 1
-                continue
+                if not overwrite_existing:
+                    # Default behavior: do not overwrite user-customized skills on re-runs
+                    skipped_count += 1
+                    continue
             skill_file.write_text(skill_content, encoding="utf-8")
             installed_count += 1
 
@@ -1676,8 +1717,64 @@ def _has_bundled_skills(project_path: Path, selected_ai: str) -> bool:
     if not skills_dir.is_dir():
         return False
 
-    pattern = "speckit.*/SKILL.md" if selected_ai == "kimi" else "speckit-*/SKILL.md"
-    return any(skills_dir.glob(pattern))
+    return any(skills_dir.glob("speckit-*/SKILL.md"))
+
+
+def _migrate_legacy_kimi_dotted_skills(skills_dir: Path) -> tuple[int, int]:
+    """Migrate legacy Kimi dotted skill dirs (speckit.xxx) to hyphenated format.
+
+    Temporary migration helper:
+    - Intended removal window: after 2026-06-25.
+    - Purpose: one-time cleanup for projects initialized before Kimi moved to
+      hyphenated skills (speckit-xxx).
+
+    Returns:
+        Tuple[migrated_count, removed_count]
+        - migrated_count: old dotted dir renamed to hyphenated dir
+        - removed_count: old dotted dir deleted when equivalent hyphenated dir existed
+    """
+    if not skills_dir.is_dir():
+        return (0, 0)
+
+    migrated_count = 0
+    removed_count = 0
+
+    for legacy_dir in sorted(skills_dir.glob("speckit.*")):
+        if not legacy_dir.is_dir():
+            continue
+        if not (legacy_dir / "SKILL.md").exists():
+            continue
+
+        suffix = legacy_dir.name[len("speckit."):]
+        if not suffix:
+            continue
+
+        target_dir = skills_dir / f"speckit-{suffix.replace('.', '-')}"
+
+        if not target_dir.exists():
+            shutil.move(str(legacy_dir), str(target_dir))
+            migrated_count += 1
+            continue
+
+        # If the new target already exists, avoid destructive cleanup unless
+        # both SKILL.md files are byte-identical.
+        target_skill = target_dir / "SKILL.md"
+        legacy_skill = legacy_dir / "SKILL.md"
+        if target_skill.is_file():
+            try:
+                if target_skill.read_bytes() == legacy_skill.read_bytes():
+                    # Preserve legacy directory when it contains extra user files.
+                    has_extra_entries = any(
+                        child.name != "SKILL.md" for child in legacy_dir.iterdir()
+                    )
+                    if not has_extra_entries:
+                        shutil.rmtree(legacy_dir)
+                        removed_count += 1
+            except OSError:
+                # Best-effort migration: preserve legacy dir on read failures.
+                pass
+
+    return (migrated_count, removed_count)
 
 
 AGENT_SKILLS_MIGRATIONS = {
@@ -1994,7 +2091,18 @@ def init(
 
             if use_github:
                 with httpx.Client(verify=local_ssl_context) as local_client:
-                    download_and_extract_template(project_path, selected_ai, selected_script, here, verbose=False, tracker=tracker, client=local_client, debug=debug, github_token=github_token)
+                    download_and_extract_template(
+                        project_path,
+                        selected_ai,
+                        selected_script,
+                        here,
+                        skip_legacy_codex_prompts=(selected_ai == "codex" and ai_skills),
+                        verbose=False,
+                        tracker=tracker,
+                        client=local_client,
+                        debug=debug,
+                        github_token=github_token,
+                    )
             else:
                 scaffold_ok = scaffold_from_core_pack(project_path, selected_ai, selected_script, here, tracker=tracker)
                 if not scaffold_ok:
@@ -2013,7 +2121,6 @@ def init(
                     if not here and project_path.exists():
                         shutil.rmtree(project_path)
                     raise typer.Exit(1)
-
             # For generic agent, rename placeholder directory to user-specified path
             if selected_ai == "generic" and ai_commands_dir:
                 placeholder_dir = project_path / ".speckit" / "commands"
@@ -2030,19 +2137,50 @@ def init(
 
             ensure_constitution_from_template(project_path, tracker=tracker)
 
+            # Determine skills directory and migrate any legacy Kimi dotted skills.
+            migrated_legacy_kimi_skills = 0
+            removed_legacy_kimi_skills = 0
+            skills_dir: Optional[Path] = None
+            if selected_ai in NATIVE_SKILLS_AGENTS:
+                skills_dir = _get_skills_dir(project_path, selected_ai)
+                if selected_ai == "kimi" and skills_dir.is_dir():
+                    (
+                        migrated_legacy_kimi_skills,
+                        removed_legacy_kimi_skills,
+                    ) = _migrate_legacy_kimi_dotted_skills(skills_dir)
+
             if ai_skills:
                 if selected_ai in NATIVE_SKILLS_AGENTS:
-                    skills_dir = _get_skills_dir(project_path, selected_ai)
-                    if not _has_bundled_skills(project_path, selected_ai):
-                        raise RuntimeError(
-                            f"Expected bundled agent skills in {skills_dir.relative_to(project_path)}, "
-                            "but none were found. Re-run with an up-to-date template."
-                        )
-                    if tracker:
-                        tracker.start("ai-skills")
-                        tracker.complete("ai-skills", f"bundled skills → {skills_dir.relative_to(project_path)}")
+                    bundled_found = _has_bundled_skills(project_path, selected_ai)
+                    if bundled_found:
+                        detail = f"bundled skills → {skills_dir.relative_to(project_path)}"
+                        if migrated_legacy_kimi_skills or removed_legacy_kimi_skills:
+                            detail += (
+                                f" (migrated {migrated_legacy_kimi_skills}, "
+                                f"removed {removed_legacy_kimi_skills} legacy Kimi dotted skills)"
+                            )
+                        if tracker:
+                            tracker.start("ai-skills")
+                            tracker.complete("ai-skills", detail)
+                        else:
+                            console.print(f"[green]✓[/green] Using {detail}")
                     else:
-                        console.print(f"[green]✓[/green] Using bundled agent skills in {skills_dir.relative_to(project_path)}/")
+                        # Compatibility fallback: convert command templates to skills
+                        # when an older template archive does not include native skills.
+                        # This keeps `specify init --here --ai codex --ai-skills` usable
+                        # in repos that already contain unrelated skills under .agents/skills.
+                        fallback_ok = install_ai_skills(
+                            project_path,
+                            selected_ai,
+                            tracker=tracker,
+                            overwrite_existing=True,
+                        )
+                        if not fallback_ok:
+                            raise RuntimeError(
+                                f"Expected bundled agent skills in {skills_dir.relative_to(project_path)}, "
+                                "but none were found and fallback conversion failed. "
+                                "Re-run with an up-to-date template."
+                            )
                 else:
                     skills_ok = install_ai_skills(project_path, selected_ai, tracker=tracker)
 
@@ -2210,7 +2348,7 @@ def init(
         if codex_skill_mode:
             return f"$speckit-{name}"
         if kimi_skill_mode:
-            return f"/skill:speckit.{name}"
+            return f"/skill:speckit-{name}"
         return f"/speckit.{name}"
 
     steps_lines.append(f"{step_num}. Start using {usage_label} with your AI agent:")
@@ -2964,7 +3102,7 @@ def preset_catalog_add(
     # Load existing config
     if config_path.exists():
         try:
-            config = yaml.safe_load(config_path.read_text()) or {}
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         except Exception as e:
             console.print(f"[red]Error:[/red] Failed to read {config_path}: {e}")
             raise typer.Exit(1)
@@ -2992,7 +3130,7 @@ def preset_catalog_add(
     })
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     install_label = "install allowed" if install_allowed else "discovery only"
     console.print(f"\n[green]✓[/green] Added catalog '[bold]{name}[/bold]' ({install_label})")
@@ -3020,7 +3158,7 @@ def preset_catalog_remove(
         raise typer.Exit(1)
 
     try:
-        config = yaml.safe_load(config_path.read_text()) or {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         console.print("[red]Error:[/red] Failed to read preset catalog config.")
         raise typer.Exit(1)
@@ -3037,7 +3175,7 @@ def preset_catalog_remove(
         raise typer.Exit(1)
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     console.print(f"[green]✓[/green] Removed catalog '{name}'")
     if not catalogs:
@@ -3306,7 +3444,7 @@ def catalog_add(
     # Load existing config
     if config_path.exists():
         try:
-            config = yaml.safe_load(config_path.read_text()) or {}
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         except Exception as e:
             console.print(f"[red]Error:[/red] Failed to read {config_path}: {e}")
             raise typer.Exit(1)
@@ -3334,7 +3472,7 @@ def catalog_add(
     })
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     install_label = "install allowed" if install_allowed else "discovery only"
     console.print(f"\n[green]✓[/green] Added catalog '[bold]{name}[/bold]' ({install_label})")
@@ -3362,7 +3500,7 @@ def catalog_remove(
         raise typer.Exit(1)
 
     try:
-        config = yaml.safe_load(config_path.read_text()) or {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         console.print("[red]Error:[/red] Failed to read catalog config.")
         raise typer.Exit(1)
@@ -3379,7 +3517,7 @@ def catalog_remove(
         raise typer.Exit(1)
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     console.print(f"[green]✓[/green] Removed catalog '{name}'")
     if not catalogs:
@@ -3516,6 +3654,15 @@ def extension_add(
         for cmd in manifest.commands:
             console.print(f"  • {cmd['name']} - {cmd.get('description', '')}")
 
+        # Report agent skills registration
+        reg_meta = manager.registry.get(manifest.id)
+        reg_skills = reg_meta.get("registered_skills", []) if reg_meta else []
+        # Normalize to guard against corrupted registry entries
+        if not isinstance(reg_skills, list):
+            reg_skills = []
+        if reg_skills:
+            console.print(f"\n[green]✓[/green] {len(reg_skills)} agent skill(s) auto-registered")
+
         console.print("\n[yellow]⚠[/yellow]  Configuration may be required")
         console.print(f"   Check: .specify/extensions/{manifest.id}/")
 
@@ -3554,14 +3701,19 @@ def extension_remove(
     installed = manager.list_installed()
     extension_id, display_name = _resolve_installed_extension(extension, installed, "remove")
 
-    # Get extension info for command count
+    # Get extension info for command and skill counts
     ext_manifest = manager.get_extension(extension_id)
     cmd_count = len(ext_manifest.commands) if ext_manifest else 0
+    reg_meta = manager.registry.get(extension_id)
+    raw_skills = reg_meta.get("registered_skills") if reg_meta else None
+    skill_count = len(raw_skills) if isinstance(raw_skills, list) else 0
 
     # Confirm removal
     if not force:
         console.print("\n[yellow]⚠  This will remove:[/yellow]")
         console.print(f"   • {cmd_count} commands from AI agent")
+        if skill_count:
+            console.print(f"   • {skill_count} agent skill(s)")
         console.print(f"   • Extension directory: .specify/extensions/{extension_id}/")
         if not keep_config:
             console.print("   • Config files (will be backed up)")

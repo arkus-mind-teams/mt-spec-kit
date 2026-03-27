@@ -510,6 +510,283 @@ class ExtensionManager:
 
         return _ignore
 
+    def _get_skills_dir(self) -> Optional[Path]:
+        """Return the active skills directory for extension skill registration.
+
+        Reads ``.specify/init-options.json`` to determine whether skills
+        are enabled and which agent was selected, then delegates to
+        the module-level ``_get_skills_dir()`` helper for the concrete path.
+
+        Kimi is treated as a native-skills agent: if ``ai == "kimi"`` and
+        ``.kimi/skills`` exists, extension installs should still propagate
+        command skills even when ``ai_skills`` is false.
+
+        Returns:
+            The skills directory ``Path``, or ``None`` if skills were not
+            enabled and no native-skills fallback applies.
+        """
+        from . import load_init_options, _get_skills_dir as resolve_skills_dir
+
+        opts = load_init_options(self.project_root)
+        if not isinstance(opts, dict):
+            opts = {}
+
+        agent = opts.get("ai")
+        if not isinstance(agent, str) or not agent:
+            return None
+
+        ai_skills_enabled = bool(opts.get("ai_skills"))
+        if not ai_skills_enabled and agent != "kimi":
+            return None
+
+        skills_dir = resolve_skills_dir(self.project_root, agent)
+        if not skills_dir.is_dir():
+            return None
+
+        return skills_dir
+
+    def _register_extension_skills(
+        self,
+        manifest: ExtensionManifest,
+        extension_dir: Path,
+    ) -> List[str]:
+        """Generate SKILL.md files for extension commands as agent skills.
+
+        For every command in the extension manifest, creates a SKILL.md
+        file in the agent's skills directory following the agentskills.io
+        specification.  This is only done when ``--ai-skills`` was used
+        during project initialisation.
+
+        Args:
+            manifest: Extension manifest.
+            extension_dir: Installed extension directory.
+
+        Returns:
+            List of skill names that were created (for registry storage).
+        """
+        skills_dir = self._get_skills_dir()
+        if not skills_dir:
+            return []
+
+        from . import load_init_options
+        from .agents import CommandRegistrar
+        import yaml
+
+        written: List[str] = []
+        opts = load_init_options(self.project_root)
+        if not isinstance(opts, dict):
+            opts = {}
+        selected_ai = opts.get("ai")
+        if not isinstance(selected_ai, str) or not selected_ai:
+            return []
+        registrar = CommandRegistrar()
+
+        for cmd_info in manifest.commands:
+            cmd_name = cmd_info["name"]
+            cmd_file_rel = cmd_info["file"]
+
+            # Guard against path traversal: reject absolute paths and ensure
+            # the resolved file stays within the extension directory.
+            cmd_path = Path(cmd_file_rel)
+            if cmd_path.is_absolute():
+                continue
+            try:
+                ext_root = extension_dir.resolve()
+                source_file = (ext_root / cmd_path).resolve()
+                source_file.relative_to(ext_root)  # raises ValueError if outside
+            except (OSError, ValueError):
+                continue
+
+            if not source_file.is_file():
+                continue
+
+            # Derive skill name from command name using the same hyphenated
+            # convention as hook rendering and preset skill registration.
+            short_name_raw = cmd_name
+            if short_name_raw.startswith("speckit."):
+                short_name_raw = short_name_raw[len("speckit."):]
+            skill_name = f"speckit-{short_name_raw.replace('.', '-')}"
+
+            # Check if skill already exists before creating the directory
+            skill_subdir = skills_dir / skill_name
+            skill_file = skill_subdir / "SKILL.md"
+            if skill_file.exists():
+                # Do not overwrite user-customized skills
+                continue
+
+            # Create skill directory; track whether we created it so we can clean
+            # up safely if reading the source file subsequently fails.
+            created_now = not skill_subdir.exists()
+            skill_subdir.mkdir(parents=True, exist_ok=True)
+
+            # Parse the command file — guard against IsADirectoryError / decode errors
+            try:
+                content = source_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                if created_now:
+                    try:
+                        skill_subdir.rmdir()  # undo the mkdir; dir is empty at this point
+                    except OSError:
+                        pass  # best-effort cleanup
+                continue
+            frontmatter, body = registrar.parse_frontmatter(content)
+            frontmatter = registrar._adjust_script_paths(frontmatter)
+            body = registrar.resolve_skill_placeholders(
+                selected_ai, frontmatter, body, self.project_root
+            )
+
+            original_desc = frontmatter.get("description", "")
+            description = original_desc or f"Extension command: {cmd_name}"
+
+            frontmatter_data = {
+                "name": skill_name,
+                "description": description,
+                "compatibility": "Requires spec-kit project structure with .specify/ directory",
+                "metadata": {
+                    "author": "github-spec-kit",
+                    "source": f"extension:{manifest.id}",
+                },
+            }
+            frontmatter_text = yaml.safe_dump(frontmatter_data, sort_keys=False).strip()
+
+            # Derive a human-friendly title from the command name
+            short_name = cmd_name
+            if short_name.startswith("speckit."):
+                short_name = short_name[len("speckit."):]
+            title_name = short_name.replace(".", " ").replace("-", " ").title()
+
+            skill_content = (
+                f"---\n"
+                f"{frontmatter_text}\n"
+                f"---\n\n"
+                f"# {title_name} Skill\n\n"
+                f"{body}\n"
+            )
+
+            skill_file.write_text(skill_content, encoding="utf-8")
+            written.append(skill_name)
+
+        return written
+
+    def _unregister_extension_skills(self, skill_names: List[str], extension_id: str) -> None:
+        """Remove SKILL.md directories for extension skills.
+
+        Called during extension removal to clean up skill files that
+        were created by ``_register_extension_skills()``.
+
+        If ``_get_skills_dir()`` returns ``None`` (e.g. the user removed
+        init-options.json or toggled ai_skills after installation), we
+        fall back to scanning all known agent skills directories so that
+        orphaned skill directories are still cleaned up.  In that case
+        each candidate directory is verified against the SKILL.md
+        ``metadata.source`` field before removal to avoid accidentally
+        deleting user-created skills with the same name.
+
+        Args:
+            skill_names: List of skill names to remove.
+            extension_id: Extension ID used to verify ownership during
+                fallback candidate scanning.
+        """
+        if not skill_names:
+            return
+
+        skills_dir = self._get_skills_dir()
+
+        if skills_dir:
+            # Fast path: we know the exact skills directory
+            for skill_name in skill_names:
+                # Guard against path traversal from a corrupted registry entry:
+                # reject names that are absolute, contain path separators, or
+                # resolve to a path outside the skills directory.
+                sn_path = Path(skill_name)
+                if sn_path.is_absolute() or len(sn_path.parts) != 1:
+                    continue
+                try:
+                    skill_subdir = (skills_dir / skill_name).resolve()
+                    skill_subdir.relative_to(skills_dir.resolve())  # raises if outside
+                except (OSError, ValueError):
+                    continue
+                if not skill_subdir.is_dir():
+                    continue
+                # Safety check: only delete if SKILL.md exists and its
+                # metadata.source matches exactly this extension — mirroring
+                # the fallback branch — so a corrupted registry entry cannot
+                # delete an unrelated user skill.
+                skill_md = skill_subdir / "SKILL.md"
+                if not skill_md.is_file():
+                    continue
+                try:
+                    import yaml as _yaml
+                    raw = skill_md.read_text(encoding="utf-8")
+                    source = ""
+                    if raw.startswith("---"):
+                        parts = raw.split("---", 2)
+                        if len(parts) >= 3:
+                            fm = _yaml.safe_load(parts[1]) or {}
+                            source = (
+                                fm.get("metadata", {}).get("source", "")
+                                if isinstance(fm, dict)
+                                else ""
+                            )
+                    if source != f"extension:{extension_id}":
+                        continue
+                except (OSError, UnicodeDecodeError, Exception):
+                    continue
+                shutil.rmtree(skill_subdir)
+        else:
+            # Fallback: scan all possible agent skills directories
+            from . import AGENT_CONFIG, DEFAULT_SKILLS_DIR
+
+            candidate_dirs: set[Path] = set()
+            for cfg in AGENT_CONFIG.values():
+                folder = cfg.get("folder", "")
+                if folder:
+                    candidate_dirs.add(self.project_root / folder.rstrip("/") / "skills")
+            candidate_dirs.add(self.project_root / DEFAULT_SKILLS_DIR)
+
+            for skills_candidate in candidate_dirs:
+                if not skills_candidate.is_dir():
+                    continue
+                for skill_name in skill_names:
+                    # Same path-traversal guard as the fast path above
+                    sn_path = Path(skill_name)
+                    if sn_path.is_absolute() or len(sn_path.parts) != 1:
+                        continue
+                    try:
+                        skill_subdir = (skills_candidate / skill_name).resolve()
+                        skill_subdir.relative_to(skills_candidate.resolve())  # raises if outside
+                    except (OSError, ValueError):
+                        continue
+                    if not skill_subdir.is_dir():
+                        continue
+                    # Safety check: only delete if SKILL.md exists and its
+                    # metadata.source matches exactly this extension.  If the
+                    # file is missing or unreadable we skip to avoid deleting
+                    # unrelated user-created directories.
+                    skill_md = skill_subdir / "SKILL.md"
+                    if not skill_md.is_file():
+                        continue
+                    try:
+                        import yaml as _yaml
+                        raw = skill_md.read_text(encoding="utf-8")
+                        source = ""
+                        if raw.startswith("---"):
+                            parts = raw.split("---", 2)
+                            if len(parts) >= 3:
+                                fm = _yaml.safe_load(parts[1]) or {}
+                                source = (
+                                    fm.get("metadata", {}).get("source", "")
+                                    if isinstance(fm, dict)
+                                    else ""
+                                )
+                        # Only remove skills explicitly created by this extension
+                        if source != f"extension:{extension_id}":
+                            continue
+                    except (OSError, UnicodeDecodeError, Exception):
+                        # If we can't verify, skip to avoid accidental deletion
+                        continue
+                    shutil.rmtree(skill_subdir)
+
     def check_compatibility(
         self,
         manifest: ExtensionManifest,
@@ -601,6 +878,10 @@ class ExtensionManager:
                 manifest, dest_dir, self.project_root
             )
 
+        # Auto-register extension commands as agent skills when --ai-skills
+        # was used during project initialisation (feature parity).
+        registered_skills = self._register_extension_skills(manifest, dest_dir)
+
         # Register hooks
         hook_executor = HookExecutor(self.project_root)
         hook_executor.register_hooks(manifest)
@@ -612,7 +893,8 @@ class ExtensionManager:
             "manifest_hash": manifest.get_hash(),
             "enabled": True,
             "priority": priority,
-            "registered_commands": registered_commands
+            "registered_commands": registered_commands,
+            "registered_skills": registered_skills,
         })
 
         return manifest
@@ -690,9 +972,15 @@ class ExtensionManager:
         if not self.registry.is_installed(extension_id):
             return False
 
-        # Get registered commands before removal
+        # Get registered commands and skills before removal
         metadata = self.registry.get(extension_id)
         registered_commands = metadata.get("registered_commands", {}) if metadata else {}
+        raw_skills = metadata.get("registered_skills", []) if metadata else []
+        # Normalize: must be a list of plain strings to avoid corrupted-registry errors
+        if isinstance(raw_skills, list):
+            registered_skills = [s for s in raw_skills if isinstance(s, str)]
+        else:
+            registered_skills = []
 
         extension_dir = self.extensions_dir / extension_id
 
@@ -700,6 +988,9 @@ class ExtensionManager:
         if registered_commands:
             registrar = CommandRegistrar()
             registrar.unregister_commands(registered_commands, self.project_root)
+
+        # Unregister agent skills
+        self._unregister_extension_skills(registered_skills, extension_id)
 
         if keep_config:
             # Preserve config files, only remove non-config files
@@ -975,8 +1266,8 @@ class ExtensionCatalog:
         if not config_path.exists():
             return None
         try:
-            data = yaml.safe_load(config_path.read_text()) or {}
-        except (yaml.YAMLError, OSError) as e:
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except (yaml.YAMLError, OSError, UnicodeError) as e:
             raise ValidationError(
                 f"Failed to read catalog config {config_path}: {e}"
             )
@@ -1467,8 +1758,8 @@ class ConfigManager:
             return {}
 
         try:
-            return yaml.safe_load(file_path.read_text()) or {}
-        except (yaml.YAMLError, OSError):
+            return yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
+        except (yaml.YAMLError, OSError, UnicodeError):
             return {}
 
     def _get_extension_defaults(self) -> Dict[str, Any]:
@@ -1644,6 +1935,52 @@ class HookExecutor:
         self.project_root = project_root
         self.extensions_dir = project_root / ".specify" / "extensions"
         self.config_file = project_root / ".specify" / "extensions.yml"
+        self._init_options_cache: Optional[Dict[str, Any]] = None
+
+    def _load_init_options(self) -> Dict[str, Any]:
+        """Load persisted init options used to determine invocation style.
+
+        Uses the shared helper from specify_cli and caches values per executor
+        instance to avoid repeated filesystem reads during hook rendering.
+        """
+        if self._init_options_cache is None:
+            from . import load_init_options
+
+            payload = load_init_options(self.project_root)
+            self._init_options_cache = payload if isinstance(payload, dict) else {}
+        return self._init_options_cache
+
+    @staticmethod
+    def _skill_name_from_command(command: Any) -> str:
+        """Map a command id like speckit.plan to speckit-plan skill name."""
+        if not isinstance(command, str):
+            return ""
+        command_id = command.strip()
+        if not command_id.startswith("speckit."):
+            return ""
+        return f"speckit-{command_id[len('speckit.'):].replace('.', '-')}"
+
+    def _render_hook_invocation(self, command: Any) -> str:
+        """Render an agent-specific invocation string for a hook command."""
+        if not isinstance(command, str):
+            return ""
+
+        command_id = command.strip()
+        if not command_id:
+            return ""
+
+        init_options = self._load_init_options()
+        selected_ai = init_options.get("ai")
+        codex_skill_mode = selected_ai == "codex" and bool(init_options.get("ai_skills"))
+        kimi_skill_mode = selected_ai == "kimi"
+
+        skill_name = self._skill_name_from_command(command_id)
+        if codex_skill_mode and skill_name:
+            return f"${skill_name}"
+        if kimi_skill_mode and skill_name:
+            return f"/skill:{skill_name}"
+
+        return f"/{command_id}"
 
     def get_project_config(self) -> Dict[str, Any]:
         """Load project-level extension configuration.
@@ -1659,8 +1996,8 @@ class HookExecutor:
             }
 
         try:
-            return yaml.safe_load(self.config_file.read_text()) or {}
-        except (yaml.YAMLError, OSError):
+            return yaml.safe_load(self.config_file.read_text(encoding="utf-8")) or {}
+        except (yaml.YAMLError, OSError, UnicodeError):
             return {
                 "installed": [],
                 "settings": {"auto_execute_hooks": True},
@@ -1675,7 +2012,8 @@ class HookExecutor:
         """
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         self.config_file.write_text(
-            yaml.dump(config, default_flow_style=False, sort_keys=False)
+            yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
         )
 
     def register_hooks(self, manifest: ExtensionManifest):
@@ -1886,21 +2224,27 @@ class HookExecutor:
         for hook in hooks:
             extension = hook.get("extension")
             command = hook.get("command")
+            invocation = self._render_hook_invocation(command)
+            command_text = command if isinstance(command, str) and command.strip() else "<missing command>"
+            display_invocation = invocation or (
+                f"/{command_text}" if command_text != "<missing command>" else "/<missing command>"
+            )
             optional = hook.get("optional", True)
             prompt = hook.get("prompt", "")
             description = hook.get("description", "")
 
             if optional:
                 lines.append(f"\n**Optional Hook**: {extension}")
-                lines.append(f"Command: `/{command}`")
+                lines.append(f"Command: `{display_invocation}`")
                 if description:
                     lines.append(f"Description: {description}")
                 lines.append(f"\nPrompt: {prompt}")
-                lines.append(f"To execute: `/{command}`")
+                lines.append(f"To execute: `{display_invocation}`")
             else:
                 lines.append(f"\n**Automatic Hook**: {extension}")
-                lines.append(f"Executing: `/{command}`")
-                lines.append(f"EXECUTE_COMMAND: {command}")
+                lines.append(f"Executing: `{display_invocation}`")
+                lines.append(f"EXECUTE_COMMAND: {command_text}")
+                lines.append(f"EXECUTE_COMMAND_INVOCATION: {display_invocation}")
 
         return "\n".join(lines)
 
@@ -1964,6 +2308,7 @@ class HookExecutor:
         """
         return {
             "command": hook.get("command"),
+            "invocation": self._render_hook_invocation(hook.get("command")),
             "extension": hook.get("extension"),
             "optional": hook.get("optional", True),
             "description": hook.get("description", ""),
@@ -2007,4 +2352,3 @@ class HookExecutor:
                     hook["enabled"] = False
 
         self.save_project_config(config)
-
