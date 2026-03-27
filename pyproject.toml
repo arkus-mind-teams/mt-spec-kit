@@ -43,6 +43,7 @@ packages = ["src/specify_cli"]
 "scripts/powershell" = "specify_cli/core_pack/scripts/powershell"
 ".github/workflows/scripts/create-release-packages.sh" = "specify_cli/core_pack/release_scripts/create-release-packages.sh"
 ".github/workflows/scripts/create-release-packages.ps1" = "specify_cli/core_pack/release_scripts/create-release-packages.ps1"
+"mcps/task-managers" = "specify_cli/core_pack/mcps/task-managers"
 
 [project.optional-dependencies]
 test = [

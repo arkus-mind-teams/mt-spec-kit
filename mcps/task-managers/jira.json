@@ -1,0 +1,22 @@
+{
+  "display_name": "Jira",
+  "prompts": [
+    {
+      "key": "url",
+      "label": "Jira instance MCP URL (e.g., https://your-domain.atlassian.net/mcp)",
+      "default": null
+    },
+    {
+      "key": "token",
+      "label": "Jira API token",
+      "default": null
+    }
+  ],
+  "server_entry": {
+    "type": "http",
+    "url": "${url}",
+    "headers": {
+      "Authorization": "Bearer ${token}"
+    }
+  }
+}

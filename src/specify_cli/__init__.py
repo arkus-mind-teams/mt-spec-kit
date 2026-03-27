@@ -987,7 +987,7 @@ def download_and_extract_template(project_path: Path, ai_assistant: str, script_
 
     try:
         if not is_current_dir:
-            project_path.mkdir(parents=True)
+            project_path.mkdir(parents=True, exist_ok=True)
 
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_contents = zip_ref.namelist()
@@ -1479,6 +1479,170 @@ SKILL_DESCRIPTIONS = {
     "checklist": "Generate custom quality checklists for validating requirements completeness and clarity. Use to create unit tests for English that ensure spec quality before implementation.",
     "taskstoissues": "Convert tasks from tasks.md into GitHub issues. Use after task breakdown to track work items in GitHub project management.",
 }
+
+
+def _get_mcp_templates() -> dict:
+    """Scan bundled mcps/task-managers/*.json and return parsed templates.
+
+    Returns a dict keyed by filename stem (e.g. "jira", "notion"), sorted
+    alphabetically.  Returns an empty dict if the directory is missing or
+    contains no valid JSON files.
+    """
+    core = _locate_core_pack()
+    if core is not None:
+        templates_dir = core / "mcps" / "task-managers"
+    else:
+        # Source-checkout / editable install: go up from src/specify_cli/
+        repo_root = Path(__file__).parent.parent.parent
+        templates_dir = repo_root / "mcps" / "task-managers"
+
+    if not templates_dir.is_dir():
+        return {}
+
+    result = {}
+    for json_file in sorted(templates_dir.glob("*.json")):
+        try:
+            with open(json_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+            result[json_file.stem] = data
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return result
+
+
+def _write_mcp_config(
+    project_path: Path,
+    server_key: str,
+    server_entry: dict,
+    console: Console,
+) -> None:
+    """Write or merge a MCP server entry into <project-root>/.claude/config.json.
+
+    Handles all documented states:
+    - .claude/ path is a file → error + raise typer.Exit(1)
+    - .claude/ missing → create dir
+    - config.json missing → create with full mcpServers structure
+    - config.json valid JSON, no mcpServers key → add key
+    - config.json valid JSON, has mcpServers → merge
+    - duplicate key → warn + confirm before overwriting
+    - malformed JSON → error + raise typer.Exit(1)
+    """
+    from rich.prompt import Confirm
+
+    claude_dir = project_path / ".claude"
+    config_path = claude_dir / "config.json"
+
+    if claude_dir.exists() and not claude_dir.is_dir():
+        console.print(
+            "[red]Error:[/red] .claude exists as a file, not a directory. "
+            "Cannot write config.json.\n"
+            "Please remove or rename the file and try again."
+        )
+        raise typer.Exit(1)
+
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    if not config_path.exists():
+        config_data = {"mcpServers": {server_key: server_entry}}
+        with open(config_path, "w", encoding="utf-8") as fh:
+            json.dump(config_data, fh, indent=2)
+        return
+
+    # config.json exists — parse it
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            config_data = json.load(fh)
+    except (json.JSONDecodeError, ValueError):
+        console.print(
+            "[red]Error:[/red] .claude/config.json contains invalid JSON. Cannot modify.\n"
+            "Please fix or remove the file and try again."
+        )
+        raise typer.Exit(1)
+
+    if "mcpServers" not in config_data:
+        config_data["mcpServers"] = {}
+
+    if server_key in config_data["mcpServers"]:
+        console.print(
+            f"[yellow]Warning:[/yellow] MCP server '{server_key}' already exists in .claude/config.json."
+        )
+        overwrite = Confirm.ask("Overwrite existing entry?", default=False)
+        if not overwrite:
+            return
+
+    config_data["mcpServers"][server_key] = server_entry
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump(config_data, fh, indent=2)
+
+
+def _prompt_mcp_task_manager(
+    project_path: Path,
+    selected_ai: str,
+    console: Console,
+    tracker: "StepTracker",
+) -> None:
+    """Prompt the user to configure a task manager MCP server.
+
+    Only relevant for Claude users.  Discovers available templates from the
+    bundled mcps/task-managers/ directory, collects credentials, and writes
+    them to <project-root>/.claude/config.json.
+    """
+    from rich.prompt import Prompt
+
+    if not sys.stdin.isatty():
+        tracker.skip("mcp-setup", "non-interactive")
+        return
+
+    templates = _get_mcp_templates()
+    if not templates:
+        tracker.skip("mcp-setup", "not applicable")
+        return
+
+    # Build selection options: "None" first, then display names sorted alphabetically
+    options = {"None": "skip task manager setup"}
+    for stem in sorted(templates.keys()):
+        options[stem] = templates[stem].get("display_name", stem)
+
+    tracker.start("mcp-setup")
+    selected_key = select_with_arrows(options, "Choose a task manager MCP to configure:", "None")
+
+    if selected_key == "None":
+        tracker.skip("mcp-setup", "none selected")
+        return
+
+    template = templates[selected_key]
+    server_entry = json.loads(json.dumps(template["server_entry"]))  # deep copy
+
+    # Collect credentials
+    values = {}
+    for prompt_def in template.get("prompts", []):
+        key = prompt_def["key"]
+        label = prompt_def["label"]
+        default = prompt_def.get("default")
+        while True:
+            value = Prompt.ask(label, default=default if default is not None else "")
+            if value or default is not None:
+                values[key] = value if value else default
+                break
+            console.print("[yellow]This field is required. Please enter a value.[/yellow]")
+
+    # Substitute ${key} placeholders in server_entry
+    def substitute(obj: Any, vals: dict) -> Any:
+        if isinstance(obj, str):
+            for k, v in vals.items():
+                obj = obj.replace(f"${{{k}}}", v)
+            return obj
+        if isinstance(obj, dict):
+            return {k: substitute(v, vals) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [substitute(item, vals) for item in obj]
+        return obj
+
+    resolved_entry = substitute(server_entry, values)
+
+    _write_mcp_config(project_path, selected_key, resolved_entry, console)
+    tracker.complete("mcp-setup", f"{selected_key} configured")
 
 
 def _get_skills_dir(project_path: Path, selected_ai: str) -> Path:
@@ -1976,12 +2140,20 @@ def init(
         tracker.add(key, label)
     if ai_skills:
         tracker.add("ai-skills", "Install agent skills")
+    tracker.add("mcp-setup", "MCP task manager")
     for key, label in [
         ("cleanup", "Cleanup"),
         ("git", "Initialize git repository"),
         ("final", "Finalize")
     ]:
         tracker.add(key, label)
+
+    # Prompt for MCP task manager before the Live block so that interactive
+    # selection (arrow keys + text input) does not conflict with the Live display.
+    if selected_ai == "claude":
+        _prompt_mcp_task_manager(project_path, selected_ai, console, tracker)
+    else:
+        tracker.skip("mcp-setup", "not applicable")
 
     # Track git error message outside Live context so it persists
     git_error_message = None

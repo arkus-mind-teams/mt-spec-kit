@@ -1,0 +1,22 @@
+{
+  "display_name": "Notion",
+  "prompts": [
+    {
+      "key": "url",
+      "label": "Notion MCP URL",
+      "default": "https://mcp.notion.com/mcp"
+    },
+    {
+      "key": "token",
+      "label": "Notion API key",
+      "default": null
+    }
+  ],
+  "server_entry": {
+    "type": "http",
+    "url": "${url}",
+    "headers": {
+      "Authorization": "Bearer ${token}"
+    }
+  }
+}
