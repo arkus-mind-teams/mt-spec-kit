@@ -5,7 +5,7 @@ Coverage:
 - US1: Claude users can configure a task manager MCP server during `specify init`
 - US2: Non-Claude agents skip the prompt entirely
 - US3: New JSON files in mcps/task-managers/ are auto-discovered (no code change)
-- Edge cases: malformed JSON, duplicate keys, empty credentials, .claude as file
+- Edge cases: malformed JSON, duplicate keys, empty credentials, .mcp.json as directory
 """
 
 import json
@@ -91,7 +91,7 @@ def tracker():
 # ===== US1: Tests for install task manager MCP =====
 
 class TestMcpConfigCreatedFresh:
-    """T009 — config.json is created fresh when Jira is selected."""
+    """T009 — .mcp.json is created fresh when Jira is selected."""
 
     def test_mcp_config_created_fresh(self, tmp_path):
         target = tmp_path / "mcp-test"
@@ -118,8 +118,8 @@ class TestMcpConfigCreatedFresh:
             )
 
         assert result.exit_code == 0, result.output
-        config_path = target / ".claude" / "config.json"
-        assert config_path.exists(), "config.json should have been created"
+        config_path = target / ".mcp.json"
+        assert config_path.exists(), ".mcp.json should have been created"
         config = json.loads(config_path.read_text())
         assert "mcpServers" in config
         assert "jira" in config["mcpServers"]
@@ -130,7 +130,7 @@ class TestMcpConfigCreatedFresh:
 
 
 class TestMcpNoneSelectionSkipsConfig:
-    """T010 — selecting None does not create config.json."""
+    """T010 — selecting None does not create .mcp.json."""
 
     def test_mcp_none_selection_skips_config(self, tmp_path):
         target = tmp_path / "mcp-test-none"
@@ -150,8 +150,7 @@ class TestMcpNoneSelectionSkipsConfig:
             )
 
         assert result.exit_code == 0, result.output
-        config_path = target / ".claude" / "config.json"
-        assert not config_path.exists(), "config.json should NOT be created when None is selected"
+        assert not (target / ".mcp.json").exists(), ".mcp.json should NOT be created when None is selected"
 
 
 class TestMcpConfigMergePreservesEntries:
@@ -167,11 +166,10 @@ class TestMcpConfigMergePreservesEntries:
         }
 
         def mock_mcp_notion(project_path, selected_ai, console, tracker):
-            # Pre-create config.json with an existing entry
-            claude_dir = project_path / ".claude"
-            claude_dir.mkdir(parents=True, exist_ok=True)
+            # Pre-create .mcp.json with an existing entry
+            project_path.mkdir(parents=True, exist_ok=True)
             existing_config = {"mcpServers": {"existing-tool": {"type": "stdio"}}}
-            (claude_dir / "config.json").write_text(json.dumps(existing_config))
+            (project_path / ".mcp.json").write_text(json.dumps(existing_config))
             # Now add Notion (should merge, not overwrite)
             _write_mcp_config(project_path, "notion", notion_entry, console)
             tracker.complete("mcp-setup", "notion configured")
@@ -188,7 +186,7 @@ class TestMcpConfigMergePreservesEntries:
             )
 
         assert result.exit_code == 0, result.output
-        config_path = target / ".claude" / "config.json"
+        config_path = target / ".mcp.json"
         assert config_path.exists()
         config = json.loads(config_path.read_text())
         assert "existing-tool" in config["mcpServers"], "Existing entry should be preserved"
@@ -196,25 +194,25 @@ class TestMcpConfigMergePreservesEntries:
         assert config["mcpServers"]["notion"]["url"] == "https://mcp.notion.com/mcp"
 
 
-class TestMcpDotClaudeIsFileAborts:
-    """T012 — if .claude exists as a file, init exits with code 1 and file is not modified."""
+class TestMcpDotMcpJsonIsDirAborts:
+    """T012 — if .mcp.json exists as a directory, init exits with code 1."""
 
-    def test_mcp_dotclaude_is_file_aborts(self, tmp_path):
-        target = tmp_path / "mcp-file-conflict"
+    def test_mcp_dotmcpjson_is_dir_aborts(self, tmp_path):
+        target = tmp_path / "mcp-dir-conflict"
 
         jira_entry = {"type": "http", "url": "https://test.example.com/mcp", "headers": {}}
 
-        def mock_mcp_file_conflict(project_path, selected_ai, console, tracker):
-            # Create project dir and .claude as a file
+        def mock_mcp_dir_conflict(project_path, selected_ai, console, tracker):
+            # Create .mcp.json as a directory instead of a file
             project_path.mkdir(parents=True, exist_ok=True)
-            claude_path = project_path / ".claude"
-            claude_path.write_text("I am a file, not a directory")
-            # Attempt to write config — should detect .claude is a file and abort
+            mcp_path = project_path / ".mcp.json"
+            mcp_path.mkdir()
+            # Attempt to write config — should detect .mcp.json is a directory and abort
             _write_mcp_config(project_path, "jira", jira_entry, console)
             tracker.complete("mcp-setup", "jira configured")  # Should not reach here
 
         runner = CliRunner()
-        with patch("specify_cli._prompt_mcp_task_manager", side_effect=mock_mcp_file_conflict), \
+        with patch("specify_cli._prompt_mcp_task_manager", side_effect=mock_mcp_dir_conflict), \
              patch("specify_cli.download_and_extract_template", side_effect=_make_fake_download), \
              patch("specify_cli.ensure_executable_scripts"), \
              patch("specify_cli.ensure_constitution_from_template"), \
@@ -224,10 +222,58 @@ class TestMcpDotClaudeIsFileAborts:
                 app, ["init", str(target), "--ai", "claude", "--script", "sh", "--no-git"]
             )
 
-        assert result.exit_code == 1, "Should exit with code 1 when .claude is a file"
-        claude_path = target / ".claude"
-        assert claude_path.is_file(), ".claude file should remain unchanged"
-        assert claude_path.read_text() == "I am a file, not a directory"
+        assert result.exit_code == 1, "Should exit with code 1 when .mcp.json is a directory"
+        mcp_path = target / ".mcp.json"
+        assert mcp_path.is_dir(), ".mcp.json directory should remain unchanged"
+
+
+class TestMcpDotClaudeConfigUntouched:
+    """US2 — pre-existing .claude/config.json is not modified by the new flow."""
+
+    def test_mcp_dotclaude_config_untouched(self, tmp_path):
+        target = tmp_path / "mcp-claude-untouched"
+
+        sentinel_content = json.dumps(
+            {"mcpServers": {"sentinel-tool": {"type": "stdio", "command": "sentinel"}}}
+        )
+
+        jira_entry = {
+            "type": "http",
+            "url": "https://test.atlassian.net/mcp",
+            "headers": {"Authorization": "Bearer test-token"},
+        }
+
+        def mock_mcp(project_path, selected_ai, console, tracker):
+            # Pre-create .claude/config.json with sentinel content
+            claude_dir = project_path / ".claude"
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            (claude_dir / "config.json").write_text(sentinel_content)
+            # Write MCP config — should go to .mcp.json, not touch .claude/config.json
+            _write_mcp_config(project_path, "jira", jira_entry, console)
+            tracker.complete("mcp-setup", "jira configured")
+
+        runner = CliRunner()
+        with patch("specify_cli._prompt_mcp_task_manager", side_effect=mock_mcp), \
+             patch("specify_cli.download_and_extract_template", side_effect=_make_fake_download), \
+             patch("specify_cli.ensure_executable_scripts"), \
+             patch("specify_cli.ensure_constitution_from_template"), \
+             patch("specify_cli.is_git_repo", return_value=False), \
+             patch("specify_cli.shutil.which", return_value="/usr/bin/git"):
+            result = runner.invoke(
+                app, ["init", str(target), "--ai", "claude", "--script", "sh", "--no-git"]
+            )
+
+        assert result.exit_code == 0, result.output
+        # .mcp.json should have the new Jira entry
+        mcp_path = target / ".mcp.json"
+        assert mcp_path.exists(), ".mcp.json should have been created"
+        mcp_config = json.loads(mcp_path.read_text())
+        assert "jira" in mcp_config["mcpServers"]
+        # .claude/config.json should be byte-for-byte unchanged
+        claude_config_path = target / ".claude" / "config.json"
+        assert claude_config_path.exists(), ".claude/config.json should still exist"
+        assert claude_config_path.read_text() == sentinel_content, \
+            ".claude/config.json must be byte-for-byte identical to the pre-created content"
 
 
 # ===== US2: Tests for skip prompt for non-Claude agents =====
@@ -251,7 +297,7 @@ class TestMcpPromptSkippedForNonClaude:
 
         assert result.exit_code == 0, result.output
         mock_mcp.assert_not_called(), "_prompt_mcp_task_manager should NOT be called for gemini"
-        assert not (target / ".claude" / "config.json").exists()
+        assert not (target / ".mcp.json").exists()
 
 
 class TestMcpPromptSkippedForInteractiveNonClaude:
@@ -275,7 +321,7 @@ class TestMcpPromptSkippedForInteractiveNonClaude:
 
         assert result.exit_code == 0, result.output
         mock_mcp.assert_not_called(), "_prompt_mcp_task_manager should NOT be called for gemini"
-        assert not (target / ".claude" / "config.json").exists()
+        assert not (target / ".mcp.json").exists()
 
 
 # ===== US3: Tests for dynamic task manager discovery =====
@@ -334,7 +380,7 @@ class TestMcpTemplatesDiscoverable:
 
 
 class TestMcpEmptyTemplatesSkipsPrompt:
-    """T022 — when no templates exist, prompt is skipped and no config.json is created."""
+    """T022 — when no templates exist, prompt is skipped and no .mcp.json is created."""
 
     def test_mcp_empty_templates_skips_prompt(self, tmp_path, tracker, console):
         target = tmp_path / "mcp-empty"
@@ -349,13 +395,13 @@ class TestMcpEmptyTemplatesSkipsPrompt:
             _prompt_mcp_task_manager(target, "claude", console, tracker)
 
         mock_select.assert_not_called(), "No selection prompt when templates are empty"
-        assert not (target / ".claude" / "config.json").exists()
+        assert not (target / ".mcp.json").exists()
 
 
 # ===== Edge Case Tests =====
 
 class TestMcpConfigMalformedJsonAborts:
-    """T025 — malformed config.json causes exit code 1 without modifying the file."""
+    """T025 — malformed .mcp.json causes exit code 1 without modifying the file."""
 
     def test_mcp_config_malformed_json_aborts(self, tmp_path):
         target = tmp_path / "mcp-malformed"
@@ -363,11 +409,9 @@ class TestMcpConfigMalformedJsonAborts:
         jira_entry = {"type": "http", "url": "https://test.example.com", "headers": {}}
 
         def mock_mcp_malformed(project_path, selected_ai, console, tracker):
-            # Create malformed config.json
-            claude_dir = project_path / ".claude"
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            config_path = claude_dir / "config.json"
-            config_path.write_text("{broken json content")
+            # Create malformed .mcp.json
+            project_path.mkdir(parents=True, exist_ok=True)
+            (project_path / ".mcp.json").write_text("{broken json content")
             # Attempt to write — should detect malformed JSON and abort
             _write_mcp_config(project_path, "jira", jira_entry, console)
             tracker.complete("mcp-setup", "configured")  # Should not reach here
@@ -384,9 +428,9 @@ class TestMcpConfigMalformedJsonAborts:
             )
 
         assert result.exit_code == 1, "Should exit with code 1 for malformed JSON"
-        config_path = target / ".claude" / "config.json"
-        assert config_path.exists()
-        assert config_path.read_text() == "{broken json content", "File should be unchanged"
+        mcp_path = target / ".mcp.json"
+        assert mcp_path.exists()
+        assert mcp_path.read_text() == "{broken json content", "File should be unchanged"
 
 
 class TestMcpConfigDuplicateKeyWarns:
@@ -394,10 +438,9 @@ class TestMcpConfigDuplicateKeyWarns:
 
     def test_mcp_config_duplicate_key_warns_and_overwrites_when_confirmed(self, tmp_path, console):
         target = tmp_path / "mcp-duplicate"
-        claude_dir = target / ".claude"
-        claude_dir.mkdir(parents=True)
+        target.mkdir(parents=True)
         existing = {"mcpServers": {"jira": {"type": "http", "url": "https://old.example.com", "headers": {}}}}
-        (claude_dir / "config.json").write_text(json.dumps(existing))
+        (target / ".mcp.json").write_text(json.dumps(existing))
 
         new_entry = {"type": "http", "url": "https://new.example.com", "headers": {}}
 
@@ -405,15 +448,14 @@ class TestMcpConfigDuplicateKeyWarns:
         with patch.object(Confirm, "ask", return_value=True):
             _write_mcp_config(target, "jira", new_entry, console)
 
-        config = json.loads((claude_dir / "config.json").read_text())
+        config = json.loads((target / ".mcp.json").read_text())
         assert config["mcpServers"]["jira"]["url"] == "https://new.example.com"
 
     def test_mcp_config_duplicate_key_skipped_when_declined(self, tmp_path, console):
         target = tmp_path / "mcp-duplicate-decline"
-        claude_dir = target / ".claude"
-        claude_dir.mkdir(parents=True)
+        target.mkdir(parents=True)
         existing = {"mcpServers": {"jira": {"type": "http", "url": "https://old.example.com", "headers": {}}}}
-        (claude_dir / "config.json").write_text(json.dumps(existing))
+        (target / ".mcp.json").write_text(json.dumps(existing))
 
         new_entry = {"type": "http", "url": "https://new.example.com", "headers": {}}
 
@@ -421,7 +463,7 @@ class TestMcpConfigDuplicateKeyWarns:
         with patch.object(Confirm, "ask", return_value=False):
             _write_mcp_config(target, "jira", new_entry, console)
 
-        config = json.loads((claude_dir / "config.json").read_text())
+        config = json.loads((target / ".mcp.json").read_text())
         assert config["mcpServers"]["jira"]["url"] == "https://old.example.com", "Old entry should be preserved"
 
 
@@ -459,8 +501,8 @@ class TestMcpEmptyCredentialsRejected:
              patch.object(sys.stdin, "isatty", return_value=True):
             _prompt_mcp_task_manager(target, "claude", console, tracker)
 
-        config_path = target / ".claude" / "config.json"
-        assert config_path.exists(), "config.json should be created after valid credentials"
+        config_path = target / ".mcp.json"
+        assert config_path.exists(), ".mcp.json should be created after valid credentials"
         config = json.loads(config_path.read_text())
         assert config["mcpServers"]["jira"]["url"] == "https://test.example.com/mcp"
         assert config["mcpServers"]["jira"]["headers"]["Authorization"] == "Bearer my-token"
@@ -496,7 +538,7 @@ class TestMcpPromptShownForInteractiveClaude:
             )
 
         assert result.exit_code == 0, result.output
-        config_path = target / ".claude" / "config.json"
+        config_path = target / ".mcp.json"
         assert config_path.exists()
         config = json.loads(config_path.read_text())
         assert config["mcpServers"]["jira"]["type"] == "http"

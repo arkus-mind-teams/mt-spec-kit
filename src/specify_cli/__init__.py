@@ -1517,45 +1517,43 @@ def _write_mcp_config(
     server_entry: dict,
     console: Console,
 ) -> None:
-    """Write or merge a MCP server entry into <project-root>/.claude/config.json.
+    """Write or merge a MCP server entry into <project-root>/.mcp.json.
 
     Handles all documented states:
-    - .claude/ path is a file → error + raise typer.Exit(1)
-    - .claude/ missing → create dir
-    - config.json missing → create with full mcpServers structure
-    - config.json valid JSON, no mcpServers key → add key
-    - config.json valid JSON, has mcpServers → merge
+    - .mcp.json path is a directory → error + raise typer.Exit(1)
+    - .mcp.json missing → create with full mcpServers structure
+    - .mcp.json valid JSON, no mcpServers key → add key
+    - .mcp.json valid JSON, has mcpServers → merge
     - duplicate key → warn + confirm before overwriting
     - malformed JSON → error + raise typer.Exit(1)
     """
     from rich.prompt import Confirm
 
-    claude_dir = project_path / ".claude"
-    config_path = claude_dir / "config.json"
+    mcp_path = project_path / ".mcp.json"
 
-    if claude_dir.exists() and not claude_dir.is_dir():
+    if mcp_path.exists() and mcp_path.is_dir():
         console.print(
-            "[red]Error:[/red] .claude exists as a file, not a directory. "
-            "Cannot write config.json.\n"
-            "Please remove or rename the file and try again."
+            "[red]Error:[/red] .mcp.json exists as a directory, not a file. "
+            "Cannot write MCP config.\n"
+            "Please remove or rename the directory and try again."
         )
         raise typer.Exit(1)
 
-    claude_dir.mkdir(parents=True, exist_ok=True)
+    mcp_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not config_path.exists():
+    if not mcp_path.exists():
         config_data = {"mcpServers": {server_key: server_entry}}
-        with open(config_path, "w", encoding="utf-8") as fh:
+        with open(mcp_path, "w", encoding="utf-8") as fh:
             json.dump(config_data, fh, indent=2)
         return
 
-    # config.json exists — parse it
+    # .mcp.json exists — parse it
     try:
-        with open(config_path, encoding="utf-8") as fh:
+        with open(mcp_path, encoding="utf-8") as fh:
             config_data = json.load(fh)
     except (json.JSONDecodeError, ValueError):
         console.print(
-            "[red]Error:[/red] .claude/config.json contains invalid JSON. Cannot modify.\n"
+            "[red]Error:[/red] .mcp.json contains invalid JSON. Cannot modify.\n"
             "Please fix or remove the file and try again."
         )
         raise typer.Exit(1)
@@ -1565,14 +1563,14 @@ def _write_mcp_config(
 
     if server_key in config_data["mcpServers"]:
         console.print(
-            f"[yellow]Warning:[/yellow] MCP server '{server_key}' already exists in .claude/config.json."
+            f"[yellow]Warning:[/yellow] MCP server '{server_key}' already exists in .mcp.json."
         )
         overwrite = Confirm.ask("Overwrite existing entry?", default=False)
         if not overwrite:
             return
 
     config_data["mcpServers"][server_key] = server_entry
-    with open(config_path, "w", encoding="utf-8") as fh:
+    with open(mcp_path, "w", encoding="utf-8") as fh:
         json.dump(config_data, fh, indent=2)
 
 
@@ -1586,7 +1584,7 @@ def _prompt_mcp_task_manager(
 
     Only relevant for Claude users.  Discovers available templates from the
     bundled mcps/task-managers/ directory, collects credentials, and writes
-    them to <project-root>/.claude/config.json.
+    them to <project-root>/.mcp.json.
     """
     from rich.prompt import Prompt
 
