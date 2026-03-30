@@ -3,20 +3,38 @@
   "prompts": [
     {
       "key": "url",
-      "label": "Jira instance MCP URL (e.g., https://your-domain.atlassian.net/mcp)",
-      "default": null
+      "label": "Jira workspace URL (e.g., https://your-domain.atlassian.net)",
+      "default": null,
+      "validate": "url"
+    },
+    {
+      "key": "username",
+      "label": "Atlassian account email address",
+      "default": null,
+      "validate": "email"
     },
     {
       "key": "token",
-      "label": "Jira API token",
+      "label": "Jira API token (generate at id.atlassian.com/manage-profile/security/api-tokens)",
       "default": null
     }
   ],
+  "env_file": {
+    "vars": {
+      "url": "JIRA_URL",
+      "username": "JIRA_USERNAME",
+      "token": "JIRA_API_TOKEN"
+    },
+    "gitignore": true
+  },
   "server_entry": {
-    "type": "http",
-    "url": "${url}",
-    "headers": {
-      "Authorization": "Bearer ${token}"
+    "type": "stdio",
+    "command": "uvx",
+    "args": ["mcp-atlassian"],
+    "env": {
+      "JIRA_URL": "${JIRA_URL}",
+      "JIRA_USERNAME": "${JIRA_USERNAME}",
+      "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"
     }
   }
 }

@@ -6,6 +6,7 @@ Coverage:
 - US2: Non-Claude agents skip the prompt entirely
 - US3: New JSON files in mcps/task-managers/ are auto-discovered (no code change)
 - Edge cases: malformed JSON, duplicate keys, empty credentials, .mcp.json as directory
+- Basic Auth flow: .env file creation, gitignore update, validation, skip-if-exists
 """
 
 import json
@@ -20,6 +21,9 @@ from specify_cli import (
     app,
     _get_mcp_templates,
     _write_mcp_config,
+    _write_env_file,
+    _ensure_gitignore_entry,
+    _validate_prompt_value,
     _prompt_mcp_task_manager,
     StepTracker,
 )
@@ -91,15 +95,21 @@ def tracker():
 # ===== US1: Tests for install task manager MCP =====
 
 class TestMcpConfigCreatedFresh:
-    """T009 — .mcp.json is created fresh when Jira is selected."""
+    """T009 — .mcp.json is created fresh when Jira is selected (new stdio/Basic Auth format)."""
 
     def test_mcp_config_created_fresh(self, tmp_path):
         target = tmp_path / "mcp-test"
 
+        # New Jira format: stdio with ${VAR} references in env block
         jira_entry = {
-            "type": "http",
-            "url": "https://test.atlassian.net/mcp",
-            "headers": {"Authorization": "Bearer test-token"},
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["mcp-atlassian"],
+            "env": {
+                "JIRA_URL": "${JIRA_URL}",
+                "JIRA_USERNAME": "${JIRA_USERNAME}",
+                "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+            },
         }
 
         def mock_mcp(project_path, selected_ai, console, tracker):
@@ -124,9 +134,12 @@ class TestMcpConfigCreatedFresh:
         assert "mcpServers" in config
         assert "jira" in config["mcpServers"]
         entry = config["mcpServers"]["jira"]
-        assert entry["type"] == "http"
-        assert entry["url"] == "https://test.atlassian.net/mcp"
-        assert entry["headers"]["Authorization"] == "Bearer test-token"
+        assert entry["type"] == "stdio"
+        assert entry["command"] == "uvx"
+        assert entry["args"] == ["mcp-atlassian"]
+        assert entry["env"]["JIRA_URL"] == "${JIRA_URL}"
+        assert entry["env"]["JIRA_USERNAME"] == "${JIRA_USERNAME}"
+        assert entry["env"]["JIRA_API_TOKEN"] == "${JIRA_API_TOKEN}"
 
 
 class TestMcpNoneSelectionSkipsConfig:
@@ -515,9 +528,14 @@ class TestMcpPromptShownForInteractiveClaude:
         target = tmp_path / "mcp-interactive-claude"
 
         jira_entry = {
-            "type": "http",
-            "url": "https://test.atlassian.net/mcp",
-            "headers": {"Authorization": "Bearer test-token"},
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["mcp-atlassian"],
+            "env": {
+                "JIRA_URL": "${JIRA_URL}",
+                "JIRA_USERNAME": "${JIRA_USERNAME}",
+                "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+            },
         }
 
         def mock_mcp(project_path, selected_ai, console, tracker):
@@ -541,6 +559,277 @@ class TestMcpPromptShownForInteractiveClaude:
         config_path = target / ".mcp.json"
         assert config_path.exists()
         config = json.loads(config_path.read_text())
-        assert config["mcpServers"]["jira"]["type"] == "http"
-        assert config["mcpServers"]["jira"]["url"] == "https://test.atlassian.net/mcp"
-        assert config["mcpServers"]["jira"]["headers"]["Authorization"] == "Bearer test-token"
+        assert config["mcpServers"]["jira"]["type"] == "stdio"
+        assert config["mcpServers"]["jira"]["command"] == "uvx"
+        assert config["mcpServers"]["jira"]["env"]["JIRA_URL"] == "${JIRA_URL}"
+
+
+# ===== Basic Auth / env_file Tests (T009–T013 in tasks.md) =====
+
+# Shared Jira template fixture used across env_file tests
+_JIRA_BASIC_AUTH_TEMPLATE = {
+    "display_name": "Jira",
+    "prompts": [
+        {"key": "url", "label": "Jira workspace URL", "default": None, "validate": "url"},
+        {"key": "username", "label": "Atlassian account email address", "default": None, "validate": "email"},
+        {"key": "token", "label": "Jira API token (generate at id.atlassian.com/manage-profile/security/api-tokens)", "default": None},
+    ],
+    "env_file": {
+        "vars": {"url": "JIRA_URL", "username": "JIRA_USERNAME", "token": "JIRA_API_TOKEN"},
+        "gitignore": True,
+    },
+    "server_entry": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["mcp-atlassian"],
+        "env": {
+            "JIRA_URL": "${JIRA_URL}",
+            "JIRA_USERNAME": "${JIRA_USERNAME}",
+            "JIRA_API_TOKEN": "${JIRA_API_TOKEN}",
+        },
+    },
+}
+
+
+def _run_jira_setup(target, url, username, token, tracker, console):
+    """Run _prompt_mcp_task_manager with Jira basic-auth template and provided credentials."""
+    from rich.prompt import Prompt
+    import sys
+
+    prompt_responses = iter([url, username, token])
+    with patch("specify_cli._get_mcp_templates", return_value={"jira": _JIRA_BASIC_AUTH_TEMPLATE}), \
+         patch("specify_cli.select_with_arrows", return_value="jira"), \
+         patch.object(Prompt, "ask", side_effect=lambda *a, **kw: next(prompt_responses)), \
+         patch.object(sys.stdin, "isatty", return_value=True):
+        _prompt_mcp_task_manager(target, "claude", console, tracker)
+
+
+class TestJiraEnvFileCreatedFresh:
+    """T009 — .env is created fresh with all three Jira credential vars."""
+
+    def test_env_file_created_with_jira_vars(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-env-fresh"
+        target.mkdir()
+
+        _run_jira_setup(target, "https://test.atlassian.net", "user@example.com", "mytoken", tracker, console)
+
+        env_path = target / ".env"
+        assert env_path.exists(), ".env should be created"
+        content = env_path.read_text()
+        assert "JIRA_URL=https://test.atlassian.net" in content
+        assert "JIRA_USERNAME=user@example.com" in content
+        assert "JIRA_API_TOKEN=mytoken" in content
+
+    def test_mcp_json_keeps_var_references(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-mcp-refs"
+        target.mkdir()
+
+        _run_jira_setup(target, "https://test.atlassian.net", "user@example.com", "mytoken", tracker, console)
+
+        config = json.loads((target / ".mcp.json").read_text())
+        entry = config["mcpServers"]["jira"]
+        assert entry["env"]["JIRA_URL"] == "${JIRA_URL}"
+        assert entry["env"]["JIRA_USERNAME"] == "${JIRA_USERNAME}"
+        assert entry["env"]["JIRA_API_TOKEN"] == "${JIRA_API_TOKEN}"
+
+
+class TestJiraEnvFileSkipsExistingVars:
+    """T010 — existing vars in .env are never overwritten; missing ones are appended."""
+
+    def test_existing_var_preserved_missing_appended(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-env-skip"
+        target.mkdir()
+        (target / ".env").write_text("JIRA_URL=https://old.atlassian.net\n")
+
+        _run_jira_setup(target, "https://new.atlassian.net", "user@example.com", "mytoken", tracker, console)
+
+        content = (target / ".env").read_text()
+        assert "JIRA_URL=https://old.atlassian.net" in content, "Existing JIRA_URL must not be overwritten"
+        assert "JIRA_URL=https://new.atlassian.net" not in content, "New URL must not replace old"
+        assert "JIRA_USERNAME=user@example.com" in content
+        assert "JIRA_API_TOKEN=mytoken" in content
+
+
+class TestGitignoreUpdatedWithEnvEntry:
+    """T011 — .gitignore is created/updated to include .env after Jira setup."""
+
+    def test_gitignore_created_with_env(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-gitignore-create"
+        target.mkdir()
+
+        _run_jira_setup(target, "https://test.atlassian.net", "user@example.com", "tok", tracker, console)
+
+        gitignore = target / ".gitignore"
+        assert gitignore.exists(), ".gitignore should be created"
+        assert ".env" in gitignore.read_text().splitlines()
+
+    def test_gitignore_appended_when_exists(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-gitignore-append"
+        target.mkdir()
+        (target / ".gitignore").write_text("*.log\n")
+
+        _run_jira_setup(target, "https://test.atlassian.net", "user@example.com", "tok", tracker, console)
+
+        lines = (target / ".gitignore").read_text().splitlines()
+        assert "*.log" in lines, "Existing .gitignore content must be preserved"
+        assert ".env" in lines
+
+
+class TestGitignoreEntryIdempotent:
+    """T012 — running Jira setup twice does not duplicate .env in .gitignore."""
+
+    def test_env_entry_not_duplicated(self, tmp_path, console):
+        target = tmp_path / "jira-gitignore-idem"
+        target.mkdir()
+
+        # Call _ensure_gitignore_entry twice
+        _ensure_gitignore_entry(target, ".env")
+        _ensure_gitignore_entry(target, ".env")
+
+        lines = (target / ".gitignore").read_text().splitlines()
+        assert lines.count(".env") == 1, ".env must appear exactly once"
+
+    def test_pre_existing_env_entry_not_duplicated(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-gitignore-pre"
+        target.mkdir()
+        (target / ".gitignore").write_text(".env\n*.log\n")
+
+        _run_jira_setup(target, "https://test.atlassian.net", "user@example.com", "tok", tracker, console)
+
+        lines = (target / ".gitignore").read_text().splitlines()
+        assert lines.count(".env") == 1, ".env must appear exactly once even when pre-existing"
+
+
+class TestNotionDirectSubstitutionUnchanged:
+    """T013 — Notion (no env_file) still resolves credentials directly into .mcp.json."""
+
+    def test_notion_uses_direct_substitution(self, tmp_path, tracker, console):
+        target = tmp_path / "notion-compat"
+        target.mkdir()
+
+        notion_template = {
+            "display_name": "Notion",
+            "prompts": [
+                {"key": "url", "label": "Notion MCP URL", "default": "https://mcp.notion.com/mcp"},
+                {"key": "token", "label": "Notion API key", "default": None},
+            ],
+            "server_entry": {
+                "type": "http",
+                "url": "${url}",
+                "headers": {"Authorization": "Bearer ${token}"},
+            },
+        }
+
+        from rich.prompt import Prompt
+        import sys
+
+        prompt_responses = iter(["https://mcp.notion.com/mcp", "notion-secret"])
+        with patch("specify_cli._get_mcp_templates", return_value={"notion": notion_template}), \
+             patch("specify_cli.select_with_arrows", return_value="notion"), \
+             patch.object(Prompt, "ask", side_effect=lambda *a, **kw: next(prompt_responses)), \
+             patch.object(sys.stdin, "isatty", return_value=True):
+            _prompt_mcp_task_manager(target, "claude", console, tracker)
+
+        config = json.loads((target / ".mcp.json").read_text())
+        entry = config["mcpServers"]["notion"]
+        assert entry["url"] == "https://mcp.notion.com/mcp", "URL should be resolved directly"
+        assert entry["headers"]["Authorization"] == "Bearer notion-secret", "Token should be resolved"
+        assert not (target / ".env").exists(), "No .env should be created for Notion"
+
+
+# ===== US2: Prompt Label Guidance Tests =====
+
+class TestJiraPromptLabelsContainGuidance:
+    """T014 — Jira prompt labels include guidance on where to get credentials."""
+
+    def test_token_label_references_api_token_url(self):
+        templates = _get_mcp_templates()
+        assert "jira" in templates, "jira template must be discoverable"
+        jira = templates["jira"]
+        token_prompt = next((p for p in jira["prompts"] if p["key"] == "token"), None)
+        assert token_prompt is not None
+        label = token_prompt["label"].lower()
+        assert "id.atlassian.com" in label or "api-tokens" in label, \
+            "Token prompt must reference where to generate API tokens"
+
+    def test_username_label_mentions_email(self):
+        templates = _get_mcp_templates()
+        jira = templates["jira"]
+        username_prompt = next((p for p in jira["prompts"] if p["key"] == "username"), None)
+        assert username_prompt is not None
+        assert "email" in username_prompt["label"].lower(), \
+            "Username prompt must mention 'email' to guide the user"
+
+
+# ===== US3: Skip If Jira Already Configured =====
+
+class TestMcpSkipIfKeyAlreadyExists:
+    """T016 — if .mcp.json already has the selected key, setup is skipped silently."""
+
+    def test_skip_when_jira_already_in_mcp_json(self, tmp_path, tracker, console):
+        target = tmp_path / "jira-skip-existing"
+        target.mkdir()
+
+        existing_entry = {
+            "type": "stdio",
+            "command": "uvx",
+            "args": ["mcp-atlassian"],
+            "env": {"JIRA_URL": "${JIRA_URL}", "JIRA_USERNAME": "${JIRA_USERNAME}", "JIRA_API_TOKEN": "${JIRA_API_TOKEN}"},
+        }
+        original_config = {"mcpServers": {"jira": existing_entry}}
+        original_text = json.dumps(original_config)
+        (target / ".mcp.json").write_text(original_text)
+
+        from rich.prompt import Prompt
+        import sys
+
+        mock_prompt = MagicMock()
+        with patch("specify_cli._get_mcp_templates", return_value={"jira": _JIRA_BASIC_AUTH_TEMPLATE}), \
+             patch("specify_cli.select_with_arrows", return_value="jira"), \
+             patch.object(Prompt, "ask", side_effect=mock_prompt), \
+             patch.object(sys.stdin, "isatty", return_value=True):
+            _prompt_mcp_task_manager(target, "claude", console, tracker)
+
+        mock_prompt.assert_not_called(), "Prompt.ask must not be called when entry already exists"
+        assert (target / ".mcp.json").read_text() == original_text, \
+            ".mcp.json must be byte-for-byte unchanged"
+
+
+# ===== Validation Helper Tests =====
+
+class TestValidatePromptValue:
+    """Unit tests for _validate_prompt_value helper."""
+
+    def test_valid_https_url(self):
+        ok, msg = _validate_prompt_value("https://test.atlassian.net", "url")
+        assert ok is True
+        assert msg == ""
+
+    def test_invalid_url_missing_scheme(self):
+        ok, msg = _validate_prompt_value("test.atlassian.net", "url")
+        assert ok is False
+        assert "https://" in msg
+
+    def test_http_url_rejected(self):
+        ok, msg = _validate_prompt_value("http://test.atlassian.net", "url")
+        assert ok is False
+
+    def test_valid_email(self):
+        ok, msg = _validate_prompt_value("user@example.com", "email")
+        assert ok is True
+
+    def test_email_with_plus(self):
+        ok, msg = _validate_prompt_value("user+tag@example.com", "email")
+        assert ok is True
+
+    def test_invalid_email_no_at(self):
+        ok, msg = _validate_prompt_value("notanemail.com", "email")
+        assert ok is False
+
+    def test_invalid_email_no_domain_dot(self):
+        ok, msg = _validate_prompt_value("user@nodot", "email")
+        assert ok is False
+
+    def test_unknown_rule_passes(self):
+        ok, msg = _validate_prompt_value("anything", "unknown_rule")
+        assert ok is True

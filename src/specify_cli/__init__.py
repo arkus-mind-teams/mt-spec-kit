@@ -1574,6 +1574,80 @@ def _write_mcp_config(
         json.dump(config_data, fh, indent=2)
 
 
+def _validate_prompt_value(value: str, rule: str) -> tuple[bool, str]:
+    """Validate a prompt value against a named rule.
+
+    Returns (True, "") on success or (False, error_message) on failure.
+    Supported rules:
+    - "url": value must start with "https://" (case-insensitive)
+    - "email": value must contain exactly one "@", non-empty local part,
+               and a domain containing at least one "."
+    """
+    if rule == "url":
+        if not value.lower().startswith("https://"):
+            return False, "URL must start with https:// (e.g., https://your-domain.atlassian.net)"
+        return True, ""
+    if rule == "email":
+        parts = value.split("@")
+        if len(parts) != 2 or not parts[0] or not parts[1] or "." not in parts[1]:
+            return False, "Please enter a valid email address (e.g., you@example.com)"
+        return True, ""
+    return True, ""
+
+
+def _write_env_file(
+    project_path: Path,
+    env_vars: dict,
+    label: str,
+    console: Console,
+) -> None:
+    """Write credential key-value pairs to <project-root>/.env.
+
+    Creates the file if it does not exist.  If it already exists, reads the
+    current content and appends only the variables that are not yet present.
+    Existing values are never overwritten.
+    """
+    env_path = project_path / ".env"
+    existing_keys: set[str] = set()
+
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                existing_keys.add(stripped.split("=", 1)[0])
+
+    missing = {k: v for k, v in env_vars.items() if k not in existing_keys}
+    if not missing:
+        return
+
+    lines = [f"# {label} (added by specify init)"]
+    for key, value in missing.items():
+        lines.append(f"{key}={value}")
+    lines.append("")
+
+    with open(env_path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+
+def _ensure_gitignore_entry(project_path: Path, entry: str) -> None:
+    """Add *entry* to <project-root>/.gitignore if it is not already present.
+
+    Creates the file if it does not exist.  Existing content is never modified;
+    the entry is only appended when no existing line (stripped) matches exactly.
+    Calling this function multiple times is safe (idempotent).
+    """
+    gitignore_path = project_path / ".gitignore"
+
+    if gitignore_path.exists():
+        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+        if any(line.strip() == entry for line in lines):
+            return
+        with open(gitignore_path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n{entry}\n")
+    else:
+        gitignore_path.write_text(f"{entry}\n", encoding="utf-8")
+
+
 def _prompt_mcp_task_manager(
     project_path: Path,
     selected_ai: str,
@@ -1609,6 +1683,18 @@ def _prompt_mcp_task_manager(
         tracker.skip("mcp-setup", "none selected")
         return
 
+    # Skip if the selected MCP is already configured in .mcp.json
+    mcp_path = project_path / ".mcp.json"
+    if mcp_path.exists() and mcp_path.is_file():
+        try:
+            with open(mcp_path, encoding="utf-8") as fh:
+                existing = json.load(fh)
+            if selected_key in existing.get("mcpServers", {}):
+                tracker.skip("mcp-setup", f"{selected_key} already configured")
+                return
+        except (json.JSONDecodeError, OSError):
+            pass  # Let _write_mcp_config handle malformed file later
+
     template = templates[selected_key]
     server_entry = json.loads(json.dumps(template["server_entry"]))  # deep copy
 
@@ -1618,28 +1704,47 @@ def _prompt_mcp_task_manager(
         key = prompt_def["key"]
         label = prompt_def["label"]
         default = prompt_def.get("default")
+        validate_rule = prompt_def.get("validate")
         while True:
             value = Prompt.ask(label, default=default if default is not None else "")
-            if value or default is not None:
-                values[key] = value if value else default
-                break
-            console.print("[yellow]This field is required. Please enter a value.[/yellow]")
+            if not value and default is None:
+                console.print("[yellow]This field is required. Please enter a value.[/yellow]")
+                continue
+            effective = value if value else default
+            if validate_rule and effective:
+                ok, error_msg = _validate_prompt_value(effective, validate_rule)
+                if not ok:
+                    console.print(f"[yellow]{error_msg}[/yellow]")
+                    continue
+            values[key] = effective
+            break
 
-    # Substitute ${key} placeholders in server_entry
-    def substitute(obj: Any, vals: dict) -> Any:
-        if isinstance(obj, str):
-            for k, v in vals.items():
-                obj = obj.replace(f"${{{k}}}", v)
+    env_file_config = template.get("env_file")
+    if env_file_config:
+        # env_file mode: write real values to .env, keep ${VAR} literals in server_entry
+        var_mapping = env_file_config.get("vars", {})
+        env_vars = {var_mapping[k]: v for k, v in values.items() if k in var_mapping}
+        display_name = template.get("display_name", selected_key)
+        _write_env_file(project_path, env_vars, f"{display_name} MCP credentials", console)
+        if env_file_config.get("gitignore"):
+            _ensure_gitignore_entry(project_path, ".env")
+        _write_mcp_config(project_path, selected_key, server_entry, console)
+    else:
+        # Standard mode: substitute ${key} placeholders directly into server_entry
+        def substitute(obj: Any, vals: dict) -> Any:
+            if isinstance(obj, str):
+                for k, v in vals.items():
+                    obj = obj.replace(f"${{{k}}}", v)
+                return obj
+            if isinstance(obj, dict):
+                return {k: substitute(v, vals) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [substitute(item, vals) for item in obj]
             return obj
-        if isinstance(obj, dict):
-            return {k: substitute(v, vals) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [substitute(item, vals) for item in obj]
-        return obj
 
-    resolved_entry = substitute(server_entry, values)
+        resolved_entry = substitute(server_entry, values)
+        _write_mcp_config(project_path, selected_key, resolved_entry, console)
 
-    _write_mcp_config(project_path, selected_key, resolved_entry, console)
     tracker.complete("mcp-setup", f"{selected_key} configured")
 
 
